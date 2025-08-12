@@ -1,19 +1,39 @@
 openapi: 3.1.0
-info: { title: RealEstate Aggregator (Building only), version: "1.2.0" }
-servers: [ { url: https://250812.vercel.app } ]
+info:
+  title: RealEstate Aggregator (Building only)
+  version: "1.2.0"
+servers:
+  - url: https://250812.vercel.app
 paths:
   /realestate/building/by-pnu/{pnu}:
     get:
-      summary: 건축물대장 표제부 조회
+      summary: 건축물대장 표제부 조회 (getBrTitleInfo)
+      description: 19자리 PNU로 건축HUB 표제부 정보를 조회합니다.
+      operationId: getBuildingTitleByPnu
       parameters:
         - in: path
           name: pnu
           required: true
-          schema: { type: string, pattern: "^[0-9]{19}$" }
-        - in: header
-          name: X-API-Key
-          required: false
-          schema: { type: string }
+          schema:
+            type: string
+            pattern: "^[0-9]{19}$"
+            description: 19자리 PNU (법정동10+대지구분1+본번4+부번4)
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pnu: { type: string }
+                  building: { type: object }
+                  lastUpdatedAt: { type: string, format: date-time }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+security:
+  - ApiKeyAuth: []
