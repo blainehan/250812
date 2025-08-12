@@ -2,34 +2,57 @@ openapi: 3.1.0
 info:
   title: RealEstate Aggregator (Building only)
   version: "1.2.0"
+  description: |
+    19자리 PNU로 건축HUB 건축물대장 **표제부(getBrTitleInfo)** 를 조회합니다.
 servers:
   - url: https://250812.vercel.app
+
 paths:
   /realestate/building/by-pnu/{pnu}:
     get:
-      summary: 건축물대장 표제부 조회 (getBrTitleInfo)
-      description: 19자리 PNU로 건축HUB 표제부 정보를 조회합니다.
       operationId: getBuildingTitleByPnu
+      summary: 건축물대장 표제부 조회 (getBrTitleInfo)
+      description: 19자리 PNU(법정동10+대지구분1+본번4+부번4)로 표제부 정보를 반환합니다.
+      security:
+        - ApiKeyAuth: []
       parameters:
         - in: path
           name: pnu
           required: true
+          description: 19자리 PNU
           schema:
             type: string
-            pattern: "^[0-9]{19}$"
-            description: 19자리 PNU (법정동10+대지구분1+본번4+부번4)
+            pattern: '^[0-9]{19}$'
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  pnu: { type: string }
-                  building: { type: object }
-                  lastUpdatedAt: { type: string, format: date-time }
+                $ref: '#/components/schemas/BuildingBundle'
+        "400":
+          description: 잘못된 요청 (예: PNU 형식 오류)
+        "401":
+          description: API 키 누락/불일치
+        "502":
+          description: 상위(공공데이터포털) 오류 또는 타임아웃
+
 components:
+  schemas:
+    BuildingBundle:
+      type: object
+      properties:
+        pnu:
+          type: string
+          description: 조회한 19자리 PNU
+        building:
+          type: object
+          description: 건축물대장 표제부 핵심 필드(원본 스키마 그대로 전달)
+          additionalProperties: true
+        lastUpdatedAt:
+          type: string
+          format: date-time
+          description: UTC ISO8601
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
