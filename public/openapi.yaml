@@ -1,14 +1,10 @@
 openapi: 3.1.0
-info:
-  title: RealEstate Aggregator (Building only)
-  version: "1.1.0"
-servers:
-  - url: https://250812.vercel.app
+info: { title: RealEstate Aggregator (Building only), version: "1.2.0" }
+servers: [ { url: https://250812.vercel.app } ]
 paths:
   /realestate/building/by-pnu/{pnu}:
     get:
-      summary: Get building register (title) by PNU
-      operationId: getBuildingByPnu
+      summary: 건축물대장 표제부 조회
       parameters:
         - in: path
           name: pnu
@@ -21,11 +17,3 @@ paths:
       responses:
         "200":
           description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  pnu: { type: string }
-                  building: { type: object }
-                  lastUpdatedAt: { type: string, format: date-time }
