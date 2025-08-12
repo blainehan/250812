@@ -4,6 +4,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 from datetime import datetime, timezone
+import asyncio
 
 app = FastAPI(title="RealEstate Aggregator", version="1.0.0")
 
