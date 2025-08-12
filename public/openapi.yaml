@@ -1,0 +1,48 @@
+openapi: 3.1.0
+info:
+  title: RealEstate Aggregator API
+  version: "1.0.0"
+servers:
+  - url: https://YOUR-PROJECT.vercel.app
+paths:
+  /realestate/by-pnu/{pnu}:
+    get:
+      summary: Get land/building/price by PNU
+      operationId: getByPnu
+      parameters:
+        - in: path
+          name: pnu
+          required: true
+          schema: { type: string, pattern: "^[0-9]{19}$" }
+        - in: query
+          name: stdrYear
+          schema: { type: string, example: "2025" }
+        - in: header
+          name: X-API-Key
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RealEstateBundle'
+components:
+  schemas:
+    RealEstateBundle:
+      type: object
+      properties:
+        pnu: { type: string }
+        summary:
+          type: object
+          properties:
+            land: { type: object }
+            building: { type: object }
+            price:
+              type: object
+              properties:
+                year: { type: string }
+                per_sqm: { type: number, description: "원/㎡" }
+                source: { type: string }
+        lastUpdatedAt: { type: string, format: date-time }

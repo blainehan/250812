@@ -1,0 +1,18 @@
+{
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.11",
+      "maxDuration": 20
+    }
+  },
+  "routes": [
+    {
+      "src": "/openapi.yaml",
+      "dest": "/public/openapi.yaml"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
+  ]
+}
