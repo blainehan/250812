@@ -1,5 +1,6 @@
 {
   "routes": [
-    { "src": "/openapi.yaml", "dest": "/public/openapi.yaml" }
+    { "src": "/openapi.yaml", "dest": "/public/openapi.yaml" },
+    { "src": "/(.*)", "dest": "/api/index.py" }
   ]
 }
