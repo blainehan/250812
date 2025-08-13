@@ -1,5 +1,5 @@
 # api/index.py
-import os, re, csv
+import os, re
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -8,23 +8,23 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
-app = FastAPI(title="RealEstate (Building: fullname+bunji→PNU)", version="1.5.0")
+app = FastAPI(title="RealEstate (fullname+bunji→PNU, no JUSO)", version="2.0.0")
 
-# 환경변수
-PUBLICDATA_KEY = os.environ.get("PUBLICDATA_KEY")      # data.go.kr 건축HUB 키(현재 동작값 그대로)
+# ── 환경변수 ────────────────────────────────────────────────────────────────
+PUBLICDATA_KEY = os.environ.get("PUBLICDATA_KEY")      # data.go.kr 인코딩키(지금 쓰던 것)
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")    # 내부 보호키(X-API-Key)
 
 BLD_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
 
-# ── PNU 앞10자리 로더 (2열: 코드 + 풀네임) ────────────────────────────────
+# ── 동명→앞10자리 매핑 로더 (CSV/TSV 자동 인식) ────────────────────────────
 PNU10_PATHS = [
-    Path(__file__).parent.parent / "data" / "pnu10.tsv",
     Path(__file__).parent.parent / "data" / "pnu10.csv",
+    Path(__file__).parent.parent / "data" / "pnu10.tsv",
 ]
 _pnu10_map: Dict[str, str] = {}
 
 def _normalize_fullname(s: str) -> str:
-    s = (s or "").strip().replace("\u3000", " ")
+    s = (s or "").replace("\u3000", " ").strip()
     s = " ".join(s.split())
     repl = {
         "서울시": "서울특별시", "서울": "서울특별시",
@@ -37,29 +37,40 @@ def _normalize_fullname(s: str) -> str:
         "세종": "세종특별자치시",
     }
     for k, v in repl.items():
-        if s.startswith(k + " "): s = s.replace(k, v, 1)
+        if s.startswith(k + " "):
+            s = v + s[len(k):]
+            break
     return s
 
-def load_pnu10():
+def _load_pnu10():
     found = None
     for p in PNU10_PATHS:
         if p.exists():
             found = p; break
     if not found:
-        raise RuntimeError(f"pnu10.tsv/csv not found in {PNU10_PATHS[0].parent}")
-    sep = "\t" if found.suffix.lower() == ".tsv" else ","
-    with open(found, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            parts = line.split(sep)
-            if len(parts) < 2: continue
-            adm = parts[0].strip()
-            full = _normalize_fullname(parts[1])
-            if re.fullmatch(r"\d{10}", adm):
-                _pnu10_map[full] = adm
+        raise RuntimeError(f"pnu10.csv/tsv not found in {PNU10_PATHS[0].parent}")
 
-load_pnu10()
+    sep = "," if found.suffix.lower() == ".csv" else "\t"
+    # utf-8-sig 로 읽어 BOM 자동 제거
+    with open(found, "r", encoding="utf-8-sig") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line: continue
+            if sep in line:
+                left, right = line.split(sep, 1)
+            else:
+                # 연속 공백으로 분리된 경우도 허용
+                parts = line.split()
+                if len(parts) >= 2:
+                    left, right = parts[0], " ".join(parts[1:])
+                else:
+                    continue
+            code10 = left.strip()
+            full = _normalize_fullname(right)
+            if re.fullmatch(r"\d{10}", code10) and full:
+                _pnu10_map[full] = code10
+
+_load_pnu10()
 
 # ── 유틸 ───────────────────────────────────────────────────────────────────
 def now_iso() -> str:
@@ -74,8 +85,10 @@ def compose_pnu(adm10: str, mtYn: str, bun: str, ji: str) -> str:
         raise HTTPException(400, "admCd10 must be 10 digits")
     if mtYn not in ("0","1"):
         raise HTTPException(400, "mtYn must be '0' or '1'")
-    bun = f"{int(re.sub(r'\\D','', bun or '0')):04d}"
-    ji  = f"{int(re.sub(r'\\D','', ji  or '0')):04d}"
+    bun = re.sub(r"\D", "", bun or "0")
+    ji  = re.sub(r"\D", "", ji  or "0")
+    bun = f"{int(bun):04d}"
+    ji  = f"{int(ji):04d}"
     return f"{adm10}{mtYn}{bun}{ji}"
 
 async def call_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,35 +127,31 @@ async def healthz(): return {"ok": True, "time": now_iso()}
 
 @app.get("/")
 async def root():
-    return {"service": "RealEstate (fullname+bunji→PNU)", "version": "1.5.0"}
+    return {"service": "RealEstate (fullname+bunji→PNU, no JUSO)", "version": "2.0.0"}
 
 @app.get("/realestate/building/by-fullname", response_model=BuildingBundle)
 async def by_fullname(
-    full: str = Query(..., description="예: '서울특별시 종로구 효자동'"),
+    full: str = Query(..., description="예: '서울특별시 종로구 청운동'"),
     bunji: str = Query(..., description="예: '24-5' (부번 없으면 '24')"),
     mtYn: str = Query("0", pattern="^[01]$", description="0=대지, 1=산"),
     pageNo: int = Query(1, ge=1),
     numOfRows: int = Query(10, ge=1, le=100),
     x_api_key: Optional[str] = Header(None),
 ):
+    """동 풀네임 + 번지 + 산여부 → PNU 조립 → 표제부 조회"""
     require_api_key(x_api_key)
 
     key = _normalize_fullname(full)
     adm10 = _pnu10_map.get(key)
     if not adm10:
-        # 비슷한 후보 힌트(최대 5)
-        cand = [k for k in _pnu10_map.keys() if key in k][:5]
+        # 후보 힌트(최대 5)
+        cand = [k for k in _pnu10_map if key in k or k in key][:5]
         raise HTTPException(404, detail={"message": f"No admCd10 for '{key}'", "candidates": cand})
 
-    # bunji 파싱
-    if "-" in bunji: a, b = bunji.split("-", 1)
-    else: a, b = bunji, "0"
-    pnu = compose_pnu(adm10, mtYn, a, b)
-
-    # upstream 조회
+    pnu = compose_pnu(adm10, mtYn, * (bunji.split("-", 1) if "-" in bunji else (bunji, "0")) )
     resp = await hub_title_by_pnu(pnu, pageNo, numOfRows)
 
-    # 첫 아이템만 요약
+    # 첫 레코드만 요약
     item = {}
     try:
         items = resp.get("response", {}).get("body", {}).get("items", {})
@@ -165,8 +174,10 @@ async def by_pnu(
     pageNo: int = Query(1, ge=1),
     numOfRows: int = Query(10, ge=1, le=100),
 ):
+    """PNU(19자리)로 직접 조회"""
     require_api_key(x_api_key)
-    if not re.fullmatch(r"\d{19}", pnu): raise HTTPException(400, "pnu must be 19 digits")
+    if not re.fullmatch(r"\d{19}", pnu):
+        raise HTTPException(400, "pnu must be 19 digits")
     resp = await hub_title_by_pnu(pnu, pageNo, numOfRows)
     item = {}
     try:
@@ -175,5 +186,9 @@ async def by_pnu(
         if isinstance(it, list) and it: item = it[0]
         elif isinstance(it, dict): item = it
     except Exception: pass
-    return {"pnu": pnu, "pnuParts": {"admCd10": pnu[:10], "mtYn": pnu[10], "bun": pnu[11:15], "ji": pnu[15:19]},
-            "building": item or resp, "lastUpdatedAt": now_iso()}
+    return {
+        "pnu": pnu,
+        "pnuParts": {"admCd10": pnu[:10], "mtYn": pnu[10], "bun": pnu[11:15], "ji": pnu[15:19]},
+        "building": item or resp,
+        "lastUpdatedAt": now_iso()
+    }
