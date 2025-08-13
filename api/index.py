@@ -8,6 +8,19 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
+from pydantic import BaseModel
+
+class FullnameReq(BaseModel):
+    full: str          # 예: "서울특별시 종로구 청운동"
+    bunji: str         # 예: "24-5" (부번 없으면 "24")
+    mtYn: str = "0"    # "0"=대지, "1"=산
+    pageNo: int = 1
+    numOfRows: int = 10
+
+def _resolve_adm10_from_full(full_input: str) -> str:
+    key = _normalize_fullname(full_input)
+    return _pnu10_map.get(key, "")
+
 app = FastAPI(title="RealEstate (fullname+bunji→PNU, no JUSO)", version="2.1.0")
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -294,3 +307,39 @@ async def debug_pnu10_lookup(full: str):
     exact = _pnu10_map.get(key)
     partial = [k for k in _pnu10_map if key in k or k in key][:10]
     return {"input": full, "normalized": key, "exact": exact, "partial": partial}
+
+@app.post("/realestate/building/by-fullname", response_model=BuildingBundle)
+async def by_fullname_post(
+    body: FullnameReq,
+    x_api_key: Optional[str] = Header(None),
+):
+    """Actions/GPT 용: JSON 바디로 한글 그대로 받기 (URL 인코딩 문제 없음)"""
+    require_api_key(x_api_key)
+
+    adm10 = _resolve_adm10_from_full(body.full)
+    if not adm10:
+        key = _normalize_fullname(body.full)
+        cand = [k for k in _pnu10_map if key in k or k in key][:5]
+        raise HTTPException(404, detail={"message": f"No admCd10 for '{key}'", "candidates": cand})
+
+    bun_raw, ji_raw = (body.bunji.split("-", 1) if "-" in body.bunji else (body.bunji, "0"))
+    pnu = compose_pnu(adm10, body.mtYn, bun_raw, ji_raw)
+
+    resp = await hub_title_by_pnu(pnu, body.pageNo, body.numOfRows)
+
+    # 첫 레코드 하나 요약 추출
+    item = {}
+    try:
+        items = resp.get("response", {}).get("body", {}).get("items", {})
+        it = items.get("item")
+        if isinstance(it, list) and it: item = it[0]
+        elif isinstance(it, dict): item = it
+    except Exception:
+        pass
+
+    return {
+        "pnu": pnu,
+        "pnuParts": {"admCd10": adm10, "mtYn": body.mtYn, "bun": pnu[11:15], "ji": pnu[15:19]},
+        "building": item or resp,
+        "lastUpdatedAt": now_iso(),
+    }
