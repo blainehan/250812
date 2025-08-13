@@ -1,5 +1,5 @@
 # api/index.py
-import os, re
+import os, re, csv
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -8,24 +8,41 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
-app = FastAPI(title="RealEstate (fullname+bunji→PNU, no JUSO)", version="2.0.0")
+app = FastAPI(title="RealEstate (fullname+bunji→PNU, no JUSO)", version="2.1.0")
 
-# ── 환경변수 ────────────────────────────────────────────────────────────────
-PUBLICDATA_KEY = os.environ.get("PUBLICDATA_KEY")      # data.go.kr 인코딩키(지금 쓰던 것)
-SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")    # 내부 보호키(X-API-Key)
+# ────────────────────────────────────────────────────────────────────────────
+# 환경변수
+#  - PUBLICDATA_KEY : data.go.kr 건축HUB 서비스키 (Encoding 키 권장)
+#  - SERVICE_API_KEY: 우리 API 보호용 키 (있으면 X-API-Key 필수)
+# ────────────────────────────────────────────────────────────────────────────
+PUBLICDATA_KEY = os.environ.get("PUBLICDATA_KEY")
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")
 
 BLD_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
 
-# ── 동명→앞10자리 매핑 로더 (CSV/TSV 자동 인식) ────────────────────────────
-PNU10_PATHS = [
+# ────────────────────────────────────────────────────────────────────────────
+# 동 풀네임 → 앞10자리(admCd10) 매핑 로더
+#  - CSV/TSV/공백 구분 자동 인식
+#  - 컬럼 순서 자동 인식: (코드,이름) 또는 (이름,코드)
+#  - 여러 경로 후보 검색
+# ────────────────────────────────────────────────────────────────────────────
+PNU10_CANDIDATES = [
     Path(__file__).parent.parent / "data" / "pnu10.csv",
     Path(__file__).parent.parent / "data" / "pnu10.tsv",
+    Path(__file__).parent / "data" / "pnu10.csv",
+    Path(__file__).parent / "data" / "pnu10.tsv",
+    Path.cwd() / "data" / "pnu10.csv",
+    Path.cwd() / "data" / "pnu10.tsv",
 ]
+
 _pnu10_map: Dict[str, str] = {}
+_pnu10_meta: Dict[str, Any] = {"path": None, "entries": 0, "delimiter": None, "reversed_cols": False}
 
 def _normalize_fullname(s: str) -> str:
+    """입력 풀네임 정규화: 공백/축약 보정"""
     s = (s or "").replace("\u3000", " ").strip()
-    s = " ".join(s.split())
+    s = " ".join(s.split())  # 중복 공백 제거
+    # 흔한 축약 보정
     repl = {
         "서울시": "서울특별시", "서울": "서울특별시",
         "부산시": "부산광역시", "부산": "부산광역시",
@@ -43,36 +60,82 @@ def _normalize_fullname(s: str) -> str:
     return s
 
 def _load_pnu10():
+    """pnu10 파일을 찾아 로드하여 _pnu10_map에 {풀네임: 코드10} 저장"""
+    global _pnu10_map, _pnu10_meta
     found = None
-    for p in PNU10_PATHS:
+    for p in PNU10_CANDIDATES:
         if p.exists():
-            found = p; break
+            found = p
+            break
     if not found:
-        raise RuntimeError(f"pnu10.csv/tsv not found in {PNU10_PATHS[0].parent}")
+        raise RuntimeError(f"pnu10.csv/tsv not found in any of: {[str(p) for p in PNU10_CANDIDATES]}")
 
-    sep = "," if found.suffix.lower() == ".csv" else "\t"
-    # utf-8-sig 로 읽어 BOM 자동 제거
-    with open(found, "r", encoding="utf-8-sig") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line: continue
-            if sep in line:
-                left, right = line.split(sep, 1)
-            else:
-                # 연속 공백으로 분리된 경우도 허용
-                parts = line.split()
-                if len(parts) >= 2:
-                    left, right = parts[0], " ".join(parts[1:])
-                else:
-                    continue
-            code10 = left.strip()
+    _pnu10_meta["path"] = str(found)
+
+    # 파일 내용 일부 샘플로 구분자 추정
+    with open(found, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        if "\t" in sample and (sample.count("\t") >= sample.count(",")):
+            delimiter = "\t"
+        elif "," in sample:
+            delimiter = ","
+        else:
+            delimiter = None  # 공백 분리 모드
+
+        rows = []
+        if delimiter:
+            reader = csv.reader(f, delimiter=delimiter)
+            rows = list(reader)
+            _pnu10_meta["delimiter"] = "\\t" if delimiter == "\t" else ","
+        else:
+            rows = [line.strip().split() for line in f if line.strip()]
+            _pnu10_meta["delimiter"] = "whitespace"
+
+    reversed_cols = False
+    for row in rows:
+        if not row:
+            continue
+
+        # 공백 모드면 이름에 공백이 있을 수 있으니 합치기
+        if _pnu10_meta["delimiter"] == "whitespace" and len(row) >= 2:
+            left = row[0]
+            right = " ".join(row[1:])
+        elif len(row) >= 2:
+            left, right = row[0], row[1]
+        else:
+            continue
+
+        left = (left or "").strip().strip('"').strip("'")
+        right = (right or "").strip().strip('"').strip("'")
+
+        # 패턴 1: left=코드(10자리), right=풀네임
+        if re.fullmatch(r"\d{10}", left):
+            code10 = left
             full = _normalize_fullname(right)
-            if re.fullmatch(r"\d{10}", code10) and full:
-                _pnu10_map[full] = code10
+        # 패턴 2: left=풀네임, right=코드(10자리)
+        elif re.fullmatch(r"\d{10}", right):
+            code10 = right
+            full = _normalize_fullname(left)
+            reversed_cols = True
+        else:
+            # 다른 형식은 스킵
+            continue
 
+        if full and re.fullmatch(r"\d{10}", code10):
+            _pnu10_map[full] = code10
+
+    _pnu10_meta["entries"] = len(_pnu10_map)
+    _pnu10_meta["reversed_cols"] = reversed_cols
+    if _pnu10_meta["entries"] == 0:
+        raise RuntimeError(f"Loaded 0 entries from {found}. Check delimiter/column order/encoding.")
+
+# 서버 시작 시 로드
 _load_pnu10()
 
-# ── 유틸 ───────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# 유틸
+# ────────────────────────────────────────────────────────────────────────────
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -80,13 +143,13 @@ def require_api_key(x_api_key: Optional[str]):
     if SERVICE_API_KEY and x_api_key != SERVICE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-def compose_pnu(adm10: str, mtYn: str, bun: str, ji: str) -> str:
+def compose_pnu(adm10: str, mtYn: str, bun_raw: str, ji_raw: str) -> str:
     if not re.fullmatch(r"\d{10}", adm10):
         raise HTTPException(400, "admCd10 must be 10 digits")
-    if mtYn not in ("0","1"):
+    if mtYn not in ("0", "1"):
         raise HTTPException(400, "mtYn must be '0' or '1'")
-    bun = re.sub(r"\D", "", bun or "0")
-    ji  = re.sub(r"\D", "", ji  or "0")
+    bun = re.sub(r"\D", "", bun_raw or "0")
+    ji  = re.sub(r"\D", "", ji_raw or "0")
     bun = f"{int(bun):04d}"
     ji  = f"{int(ji):04d}"
     return f"{adm10}{mtYn}{bun}{ji}"
@@ -106,28 +169,38 @@ async def hub_title_by_pnu(pnu: str, pageNo: int, numOfRows: int):
     if not PUBLICDATA_KEY:
         raise HTTPException(500, "PUBLICDATA_KEY is not set")
     params = {
-        "serviceKey": PUBLICDATA_KEY, "_type": "json",
-        "sigunguCd": pnu[:5], "bjdongCd": pnu[5:10],
-        "platGbCd": pnu[10], "bun": pnu[11:15], "ji": pnu[15:19],
-        "numOfRows": numOfRows, "pageNo": pageNo
+        "serviceKey": PUBLICDATA_KEY,
+        "_type": "json",
+        "sigunguCd": pnu[:5],
+        "bjdongCd": pnu[5:10],
+        "platGbCd": pnu[10],
+        "bun": pnu[11:15],
+        "ji": pnu[15:19],
+        "numOfRows": numOfRows,
+        "pageNo": pageNo,
     }
     url = f"{BLD_BASE}/getBrTitleInfo"
     return await call_json(url, params)
 
-# ── 응답 스키마 ─────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# 응답 스키마
+# ────────────────────────────────────────────────────────────────────────────
 class BuildingBundle(BaseModel):
     pnu: str
     pnuParts: Dict[str, Any]
     building: Dict[str, Any]
     lastUpdatedAt: str
 
-# ── 라우트 ──────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# 라우트
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/healthz")
-async def healthz(): return {"ok": True, "time": now_iso()}
+async def healthz():
+    return {"ok": True, "time": now_iso()}
 
 @app.get("/")
 async def root():
-    return {"service": "RealEstate (fullname+bunji→PNU, no JUSO)", "version": "2.0.0"}
+    return {"service": "RealEstate (fullname+bunji→PNU, no JUSO)", "version": "2.1.0"}
 
 @app.get("/realestate/building/by-fullname", response_model=BuildingBundle)
 async def by_fullname(
@@ -144,11 +217,14 @@ async def by_fullname(
     key = _normalize_fullname(full)
     adm10 = _pnu10_map.get(key)
     if not adm10:
-        # 후보 힌트(최대 5)
+        # 입력이 풀네임과 완전히 같지 않으면 부분일치 후보 제공
         cand = [k for k in _pnu10_map if key in k or k in key][:5]
         raise HTTPException(404, detail={"message": f"No admCd10 for '{key}'", "candidates": cand})
 
-    pnu = compose_pnu(adm10, mtYn, * (bunji.split("-", 1) if "-" in bunji else (bunji, "0")) )
+    # bunji 파싱: "본-부" → (본,부), "본" → (본,"0")
+    bun_raw, ji_raw = (bunji.split("-", 1) if "-" in bunji else (bunji, "0"))
+    pnu = compose_pnu(adm10, mtYn, bun_raw, ji_raw)
+
     resp = await hub_title_by_pnu(pnu, pageNo, numOfRows)
 
     # 첫 레코드만 요약
@@ -156,15 +232,18 @@ async def by_fullname(
     try:
         items = resp.get("response", {}).get("body", {}).get("items", {})
         it = items.get("item")
-        if isinstance(it, list) and it: item = it[0]
-        elif isinstance(it, dict): item = it
-    except Exception: pass
+        if isinstance(it, list) and it:
+            item = it[0]
+        elif isinstance(it, dict):
+            item = it
+    except Exception:
+        pass
 
     return {
         "pnu": pnu,
         "pnuParts": {"admCd10": adm10, "mtYn": mtYn, "bun": pnu[11:15], "ji": pnu[15:19]},
         "building": item or resp,
-        "lastUpdatedAt": now_iso()
+        "lastUpdatedAt": now_iso(),
     }
 
 @app.get("/realestate/building/by-pnu/{pnu}", response_model=BuildingBundle)
@@ -183,12 +262,35 @@ async def by_pnu(
     try:
         items = resp.get("response", {}).get("body", {}).get("items", {})
         it = items.get("item")
-        if isinstance(it, list) and it: item = it[0]
-        elif isinstance(it, dict): item = it
-    except Exception: pass
+        if isinstance(it, list) and it:
+            item = it[0]
+        elif isinstance(it, dict):
+            item = it
+    except Exception:
+        pass
     return {
         "pnu": pnu,
         "pnuParts": {"admCd10": pnu[:10], "mtYn": pnu[10], "bun": pnu[11:15], "ji": pnu[15:19]},
         "building": item or resp,
-        "lastUpdatedAt": now_iso()
+        "lastUpdatedAt": now_iso(),
     }
+
+# ────────────────────────────────────────────────────────────────────────────
+# 디버그 엔드포인트 (파일 로딩/매칭 확인용)
+# ────────────────────────────────────────────────────────────────────────────
+@app.get("/debug/pnu10/stats")
+async def debug_pnu10_stats():
+    return {
+        "path": _pnu10_meta.get("path"),
+        "entries": _pnu10_meta.get("entries"),
+        "delimiter": _pnu10_meta.get("delimiter"),
+        "reversed_cols": _pnu10_meta.get("reversed_cols"),
+        "sample_5": list(_pnu10_map.items())[:5],
+    }
+
+@app.get("/debug/pnu10/lookup")
+async def debug_pnu10_lookup(full: str):
+    key = _normalize_fullname(full)
+    exact = _pnu10_map.get(key)
+    partial = [k for k in _pnu10_map if key in k or k in key][:10]
+    return {"input": full, "normalized": key, "exact": exact, "partial": partial}
