@@ -1,3 +1,17 @@
+# Python
 __pycache__/
+*.pyc
+.venv/
 .env
-.venv
+.env.*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Vercel / build
+.vercel/
+dist/
+build/
