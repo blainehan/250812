@@ -287,4 +287,5 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return {"service": "RealEstate Toolkit", "version": "4.1.0"}
+    return {"service": "RealEstate Toolkit", "version": "4.1.1"}
+
