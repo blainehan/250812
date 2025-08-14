@@ -7,10 +7,10 @@
 
     { "src": "^/healthz$", "dest": "api/index.py" },
 
-    { "src": "^/pnu/.*$", "dest": "api/index.py" },
-    { "src": "^/realestate/.*$", "dest": "api/index.py" },
+    { "src": "^/pnu(/.*)?$", "dest": "api/index.py" },
+    { "src": "^/realestate(/.*)?$", "dest": "api/index.py" },
 
-    { "src": "^/$", "dest": "api/index.py" },          // 루트(JSON 버전 확인용)
-    { "src": "^(?!/public/).*$", "dest": "api/index.py" } // 나머지 전부 FastAPI로
+    { "src": "^/$", "dest": "api/index.py" },
+    { "src": "^(?!/public/).*$", "dest": "api/index.py" }
   ]
 }
