@@ -8,11 +8,11 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Body
 from pydantic import BaseModel
 
-app = FastAPI(title="RealEstate Toolkit", version="4.0.0")
+app = FastAPI(title="RealEstate Toolkit", version="4.1.0")
 
 # ── ENV ─────────────────────────────────────────────────────────────────────
 PUBLICDATA_KEY = os.environ.get("PUBLICDATA_KEY")      # data.go.kr (Encoding Key)
-SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")    # Internal API key (X-API-Key)
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")    # Internal API key (X-API-Key header)
 
 BLD_BASE = "https://apis.data.go.kr/1613000/BldRgstHubService"
 
@@ -35,7 +35,7 @@ async def call_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             raise HTTPException(502, "Non-JSON response from upstream")
 
-# ── PNU10 loader (동 풀네임 → 10자리) ───────────────────────────────────────
+# ── PNU10 loader (동 풀네임 → 10자리코드) ───────────────────────────────────
 _PNU10_FILES = [
     Path(__file__).parent.parent / "data" / "pnu10.csv",
     Path(__file__).parent.parent / "data" / "pnu10.tsv",
@@ -45,7 +45,7 @@ _PNU10_FILES = [
     Path.cwd() / "data" / "pnu10.tsv",
 ]
 _PNU_MAP: Dict[str, str] = {}   # {"서울특별시 서초구 양재동": "1165010200", ...}
-_PNU_META: Dict[str, Any] = {"path": None, "entries": 0, "delimiter": None}
+_PNU_META: Dict[str, Any] = {"path": None, "entries": 0, "delimiter": None, "reversed_cols": False}
 
 def _norm_name(s: str) -> str:
     if not s: return ""
@@ -76,7 +76,7 @@ def _load_pnu10_once():
         if p.exists():
             found = p; break
     if not found:
-        # 변환기만 제한되고 나머진 정상 동작
+        # 변환기만 제한되고 나머지 라우트는 동작 가능
         return
     with open(found, "r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(4096); f.seek(0)
@@ -86,13 +86,13 @@ def _load_pnu10_once():
             delim = ","
         else:
             delim = None
-        rows: List[List[str]]
         if delim:
             rows = list(csv.reader(f, delimiter=delim))
             _PNU_META["delimiter"] = "\\t" if delim == "\t" else ","
         else:
             rows = [line.strip().split() for line in f if line.strip()]
             _PNU_META["delimiter"] = "whitespace"
+
     reversed_cols = False
     for row in rows:
         if not row: continue
@@ -112,6 +112,7 @@ def _load_pnu10_once():
             continue
         if full and re.fullmatch(r"\d{10}", code10):
             _PNU_MAP[full] = code10
+
     _PNU_META["path"] = str(found)
     _PNU_META["entries"] = len(_PNU_MAP)
     _PNU_META["reversed_cols"] = reversed_cols
@@ -286,4 +287,4 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return {"service": "RealEstate Toolkit", "version": "4.0.0"}
+    return {"service": "RealEstate Toolkit", "version": "4.1.0"}
