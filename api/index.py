@@ -47,6 +47,16 @@ _PNU10_FILES = [
 _PNU_MAP: Dict[str, str] = {}   # {"서울특별시 서초구 양재동": "1165010200", ...}
 _PNU_META: Dict[str, Any] = {"path": None, "entries": 0, "delimiter": None, "reversed_cols": False}
 
+def _maybe_fix_mojibake(s: str) -> str:
+    # '����' 같은 U+FFFD(�)가 섞여 있으면 CP949 재해석 시도
+    if "\ufffd" in s:
+        try:
+            # latin-1로 바이트 복원 후 cp949로 해석
+            return s.encode("latin-1", "ignore").decode("cp949")
+        except Exception:
+            return s
+    return s
+    
 def _norm_name(s: str) -> str:
     if not s: return ""
     s = s.replace("\u3000", " ").strip()
