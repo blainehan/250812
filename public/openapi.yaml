@@ -1,28 +1,116 @@
+openapi: 3.1.0
+info:
+  title: RealEstate Toolkit
+  version: "4.1.0"
+servers:
+  - url: https://250812.vercel.app
+
 paths:
-  /realestate/building/by-fullname:
+  /pnu/convert:
+    post:
+      operationId: convertTextToPnu
+      summary: 자유 텍스트(예: '양재동 2-14')를 PNU(19자리)로 변환
+      description: 사용자가 입력한 한국 주소/동+번지 텍스트를 파싱하여 PNU(19자리)를 생성합니다. 유일 매칭이 아니면 candidates를 반환합니다.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  description: "예: '서울특별시 서초구 양재동 2-14', '서초구 양재동 산2-14', '양재동 2-14'"
+      responses:
+        "200":
+          description: 변환 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConvertResp"
+
     get:
-      operationId: getBuildingTitleByFullname
-      summary: 건축물대장 표제부 (풀네임+번지→PNU, no JUSO)
-      security: [ { ApiKeyAuth: [] } ]
+      operationId: convertTextToPnuGet
+      summary: (테스트용) 쿼리로 텍스트 → PNU 변환
+      security:
+        - ApiKeyAuth: []
       parameters:
         - in: query
-          name: full
+          name: text
           required: true
           schema: { type: string }
-          description: "예: '서울특별시 종로구 청운동'"
-        - in: query
-          name: bunji
+          description: "예: '양재동 2-14'"
+      responses:
+        "200":
+          description: 변환 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConvertResp"
+
+  /realestate/building/by-pnu/{pnu}:
+    get:
+      operationId: getBuildingTitleByPnu
+      summary: 건축물대장 표제부 조회 (PNU 19자리)
+      description: PNU(19자리)로 공공데이터포털 건축HUB의 getBrTitleInfo를 조회합니다.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: path
+          name: pnu
           required: true
-          schema: { type: string }
-          description: "예: '24-5' (부번 없으면 '24')"
+          schema:
+            type: string
+            pattern: '^\d{19}$'
+          description: "예: 116501020000020014"
         - in: query
-          name: mtYn
-          required: false
-          schema: { type: string, pattern: "^[01]$" }
-          description: "0=대지, 1=산 (기본 0)"
+          name: pageNo
+          schema: { type: integer, default: 1, minimum: 1 }
+        - in: query
+          name: numOfRows
+          schema: { type: integer, default: 10, minimum: 1, maximum: 100 }
       responses:
         "200":
           description: OK
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BuildingBundle' }
+              schema:
+                $ref: "#/components/schemas/BuildingBundle"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    ConvertResp:
+      type: object
+      properties:
+        ok: { type: boolean }
+        input: { type: string }
+        normalized: { type: string, nullable: true }
+        full: { type: string, nullable: true }
+        admCd10: { type: string, nullable: true }
+        bun: { type: string, nullable: true }
+        ji: { type: string, nullable: true }
+        mtYn: { type: string, nullable: true }
+        pnu: { type: string, nullable: true }
+        candidates:
+          type: array
+          items: { type: string }
+    BuildingBundle:
+      type: object
+      properties:
+        pnu: { type: string }
+        pnuParts:
+          type: object
+          additionalProperties: true
+        building:
+          type: object
+          additionalProperties: true
+        lastUpdatedAt: { type: string }
