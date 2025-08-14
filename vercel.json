@@ -1,15 +1,15 @@
 {
   "functions": {
-    "api/**/*.py": { "runtime": "python3.11" }
+    "api/index.py": {
+      "runtime": "python3.11",
+      "includeFiles": "data/pnu10.csv"
+    }
   },
   "routes": [
     { "src": "^/public/(.*)$", "dest": "/public/$1" },
-
     { "src": "^/healthz$", "dest": "api/index.py" },
-
     { "src": "^/pnu(/.*)?$", "dest": "api/index.py" },
     { "src": "^/realestate(/.*)?$", "dest": "api/index.py" },
-
     { "src": "^/$", "dest": "api/index.py" },
     { "src": "^(?!/public/).*$", "dest": "api/index.py" }
   ]
