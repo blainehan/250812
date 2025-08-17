@@ -1,10 +1,9 @@
 {
   "functions": {
-    "api/main.py": {
-      "runtime": "python3.11"
-    }
+    "api/index.py": { "runtime": "python3.11" }
   },
   "routes": [
+    { "src": "^/healthz$", "dest": "/api/index.py" },
     { "src": "/(.*)", "dest": "/api/index.py" }
   ]
 }
