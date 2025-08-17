@@ -94,28 +94,14 @@ async def kakao_search_address(query: str) -> dict:
             raise HTTPException(status_code=502, detail=f"Kakao upstream error: {e}") from e
 
 def _pick_best_document(docs: list) -> Optional[dict]:
-    """가장 적합한 결과 1개 선택. 기본은 documents[0]."""
     if not docs:
         return None
-    # 필요하면 road_address 존재/일치 조건으로 가중치 줄 수 있음. 일단 첫번째.
     return docs[0]
 
 def _doc_to_pnu_parts(doc: dict) -> Tuple[str, str, str, str, str]:
-    """
-    Kakao documents[*]에서 PNU 구성요소 추출:
-      - admCd10 = b_code (법정동 10자리)
-      - mtYn    = mountain_yn → 'Y'->'1', else '0'
-      - bun, ji = main_address_no, sub_address_no (없으면 0)
-      - full    = address.address_name (or road_address.address_name)
-    우선 address 객체를 쓰고, 없으면 road_address를 사용.
-    """
-    target = None
-    full_name = None
-
     addr = doc.get("address") or {}
     road = doc.get("road_address") or {}
 
-    # prefer parcel address
     if addr and addr.get("b_code"):
         target = addr
         full_name = addr.get("address_name")
@@ -152,6 +138,20 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
+    return {
+        "ok": True,
+        "time": utc_now_iso(),
+        "kakao": bool(KAKAO_REST_KEY),
+        "publicdata": bool(PUBLICDATA_KEY),
+    }
+
+# 추가 엔드포인트들
+@app.get("/version")
+async def version():
+    return {"version": APP_VERSION, "who": "fastapi-index"}
+
+@app.get("/_healthz")
+async def _healthz():
     return {
         "ok": True,
         "time": utc_now_iso(),
