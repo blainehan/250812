@@ -1,13 +1,10 @@
 {
   "functions": {
-    "api/index.py": { "runtime": "python3.11" }
+    "api/main.py": {
+      "runtime": "python3.11"
+    }
   },
   "routes": [
-    { "src": "^/public/(.*)$", "dest": "/public/$1" },
-    { "src": "^/healthz$",     "dest": "api/index.py" },
-    { "src": "^/pnu(/.*)?$",   "dest": "api/index.py" },
-    { "src": "^/realestate(/.*)?$", "dest": "api/index.py" },
-    { "src": "^/$",            "dest": "api/index.py" },
-    { "src": "^(?!/public/).*$", "dest": "api/index.py" }
+    { "src": "/(.*)", "dest": "/api/main.py" }
   ]
 }
