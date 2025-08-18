@@ -1,9 +1,11 @@
 {
   "functions": {
-    "api/index.py": { "runtime": "python3.11" }
+    "**/*.py": {
+      "runtime": "python3.11",
+      "includeFiles": "pnu10.csv"
+    }
   },
   "routes": [
-    { "src": "^/healthz$", "dest": "/api/index.py" },
     { "src": "/(.*)", "dest": "/api/index.py" }
   ]
 }
