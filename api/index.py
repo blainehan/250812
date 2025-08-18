@@ -1,26 +1,21 @@
+
 from __future__ import annotations
 
 import os, re
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
 import httpx
+import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 from urllib.parse import unquote_plus
 
-APP_VERSION = "5.0.0"  # Kakao Local API only
+APP_VERSION = "7.0.0"  # CSV-only (no Kakao)
 
-app = FastAPI(
-    title="RealEstate Toolkit (Kakao-only)",
-    description="카카오 로컬 API로 주소→PNU, 공공데이터포털로 PNU→건축물대장(표제부)",
-    version=APP_VERSION,
-)
-
-# ── ENV ─────────────────────────────────────────────────────────────────────────
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
-PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")     # 공공데이터포털 일반 인증키(Decoding)
-KAKAO_REST_KEY  = os.getenv("KAKAO_REST_KEY", "")     # 카카오 로컬 REST API 키
+PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")
+PNU10_CSV_PATH  = os.getenv("PNU10_CSV_PATH", "pnu10.csv")
 
 def require_api_key(x_api_key: Optional[str]):
     if not SERVICE_API_KEY:
@@ -31,11 +26,10 @@ def require_api_key(x_api_key: Optional[str]):
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-# ── Utils ──────────────────────────────────────────────────────────────────────
 def _fix_input_text(raw: str) -> str:
-    """브라우저/툴에서 이중 인코딩/깨짐을 최대한 복구."""
     if not raw:
         return ""
+    from urllib.parse import unquote_plus
     text = unquote_plus(raw)
     if "%" in text:
         try:
@@ -51,7 +45,6 @@ def _fix_input_text(raw: str) -> str:
             pass
     return text.strip()
 
-# ── Schemas ────────────────────────────────────────────────────────────────────
 class ConvertReq(BaseModel):
     text: str
 
@@ -65,6 +58,7 @@ class ConvertResp(BaseModel):
     ji: Optional[str] = None
     mtYn: Optional[str] = None
     pnu: Optional[str] = None
+    source: Optional[str] = None
     candidates: Optional[List[str]] = None
 
 class BuildingBundle(BaseModel):
@@ -72,80 +66,134 @@ class BuildingBundle(BaseModel):
     building: Optional[dict] = None
     lastUpdatedAt: str
 
-# ── Kakao Local API ────────────────────────────────────────────────────────────
-KAKAO_ADDR_URL = "https://dapi.kakao.com/v2/local/search/address.json"
+_DASHES = "－–—"
 
-async def kakao_search_address(query: str) -> dict:
-    if not KAKAO_REST_KEY:
-        raise HTTPException(status_code=500, detail="KAKAO_REST_KEY not set")
+def _norm_spaces(s: str) -> str:
+    import re
+    return re.sub(r"\s+", " ", s).strip()
 
-    headers = {"Authorization": f"KakaoAK {KAKAO_REST_KEY}"}
-    params = {"query": query, "analyze_type": "similar"}
+def normalize_address(s: str) -> str:
+    s = s.replace("서울시", "서울특별시").replace("서울 특별시", "서울특별시")
+    s = s.replace("광역 시", "광역시")
+    for ch in _DASHES:
+        s = s.replace(ch, "-")
+    return _norm_spaces(s)
 
-    async with httpx.AsyncClient(timeout=15) as client:
+def _aliases_for_name(name: str):
+    import re
+    aliases = {name}
+    if " " in name:
+        aliases.add(name.replace(" ", ""))
+    m = re.match(r"(.+동)\s*(\d+)가$", name)
+    if m:
+        aliases.add(m.group(1) + m.group(2) + "가")
+    return list(aliases)
+
+def _token_boundary_match(addr: str, candidate: str) -> bool:
+    import re
+    esc = re.escape(candidate)
+    pat = rf"(?<![가-힣A-Za-z0-9]){esc}(?![가-힣A-Za-z])"
+    return re.search(pat, addr) is not None
+
+import re as _re
+_BUN_JI_RE = _re.compile(
+    r"""
+    (?:^|[\s,()])
+    (?:산\s*)?
+    (?P<bun>\d{1,6})
+    (?:\s*-\s*(?P<ji>\d{1,6}))?
+    (?!\d)
+    """, _re.VERBOSE
+)
+
+def parse_bunjib(addr: str):
+    mt = 1 if _re.search(r"\b산\s*\d", addr) else 0
+    matches = list(_BUN_JI_RE.finditer(addr))
+    if not matches:
+        return mt, None, None
+    m = matches[-1]
+    bun = int(m.group("bun"))
+    ji = int(m.group("ji")) if m.group("ji") else 0
+    return mt, bun, ji
+
+class CSVConverter:
+    def __init__(self, csv_path: str = "pnu10.csv", encoding="utf-8"):
+        self.ok = False
+        self.alias_list = []
         try:
-            r = await client.get(KAKAO_ADDR_URL, headers=headers, params=params)
-            r.raise_for_status()
-            data = r.json()
-            return data
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Kakao error: {e.response.text}") from e
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Kakao upstream error: {e}") from e
+            df = pd.read_csv(csv_path, sep=",", encoding=encoding, low_memory=False)
+            df["법정동"] = df["법정동"].astype(str).str.strip()
+            df["pnu10"] = df["pnu"].astype(str).str.zfill(10)
+            items = []
+            for name, code in zip(df["법정동"], df["pnu10"]):
+                for al in _aliases_for_name(name):
+                    items.append((al, code, name))
+            items.sort(key=lambda x: len(x[0]), reverse=True)
+            self.alias_list = items
+            self.ok = True
+        except Exception:
+            self.ok = False
 
-def _pick_best_document(docs: list) -> Optional[dict]:
-    if not docs:
-        return None
-    return docs[0]
+    @staticmethod
+    def build_pnu(code10: str, mt: int, bun: int, ji: int) -> str:
+        return f"{code10}{mt}{bun:04d}{ji:04d}"
 
-def _doc_to_pnu_parts(doc: dict) -> Tuple[str, str, str, str, str]:
-    addr = doc.get("address") or {}
-    road = doc.get("road_address") or {}
+    def find_best_dong(self, addr: str):
+        for alias, code10, canonical in self.alias_list:
+            if alias in addr and _token_boundary_match(addr, alias):
+                return canonical, code10
+        return None, None
 
-    if addr and addr.get("b_code"):
-        target = addr
-        full_name = addr.get("address_name")
-    elif road and road.get("b_code"):
-        target = road
-        full_name = road.get("address_name")
-    else:
-        raise HTTPException(status_code=404, detail="Kakao document has no usable b_code")
+    def convert(self, address: str) -> Dict[str, Any]:
+        raw = address
+        addr = normalize_address(address)
+        mt, bun, ji = parse_bunjib(addr)
+        name, code10 = self.find_best_dong(addr)
+        result = {
+            "ok": False,
+            "input": raw,
+            "normalized": addr,
+            "full": None,
+            "admCd10": code10,
+            "bun": f"{bun:04d}" if isinstance(bun, int) else None,
+            "ji": f"{ji:04d}" if isinstance(ji, int) else None,
+            "mtYn": str(mt) if isinstance(mt, int) else None,
+            "pnu": None,
+            "source": "csv",
+            "candidates": None,
+        }
+        if code10 is None:
+            return result
+        if bun is None:
+            return result
+        pnu = self.build_pnu(code10, mt, bun, ji if ji is not None else 0)
+        result.update({"ok": True, "pnu": pnu, "full": name})
+        return result
 
-    b_code = target.get("b_code", "")
-    if not re.fullmatch(r"\d{10}", b_code or ""):
-        raise HTTPException(status_code=400, detail=f"Invalid b_code from Kakao: {b_code}")
+_csv = CSVConverter(PNU10_CSV_PATH)
 
-    mountain_yn = target.get("mountain_yn", "N")
-    mtYn = "1" if (str(mountain_yn).upper() == "Y") else "0"
+from fastapi import FastAPI, Header, HTTPException, Query
 
-    bun_raw = target.get("main_address_no")
-    ji_raw  = target.get("sub_address_no")
-    try:
-        bun = f"{int(bun_raw):04d}" if bun_raw not in (None, "",) else "0000"
-    except Exception:
-        bun = "0000"
-    try:
-        ji = f"{int(ji_raw):04d}" if ji_raw not in (None, "",) else "0000"
-    except Exception:
-        ji = "0000"
+app = FastAPI(
+    title="RealEstate Toolkit (CSV-only)",
+    description="CSV(법정동 10자리) 기반 주소→PNU, 공공데이터포털로 PNU→건축물대장(표제부)",
+    version=APP_VERSION,
+)
 
-    return b_code, mtYn, bun, ji, (full_name or "")
-
-# ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "RealEstate (Kakao-only)", "version": APP_VERSION}
+    return {"service": "RealEstate Toolkit (CSV-only)", "version": APP_VERSION}
 
 @app.get("/healthz")
 async def healthz():
     return {
         "ok": True,
         "time": utc_now_iso(),
-        "kakao": bool(KAKAO_REST_KEY),
         "publicdata": bool(PUBLICDATA_KEY),
+        "csv_loaded": _csv.ok,
+        "csv_path": PNU10_CSV_PATH if _csv.ok else None,
     }
 
-# 추가 엔드포인트들
 @app.get("/version")
 async def version():
     return {"version": APP_VERSION, "who": "fastapi-index"}
@@ -155,28 +203,19 @@ async def _healthz():
     return {
         "ok": True,
         "time": utc_now_iso(),
-        "kakao": bool(KAKAO_REST_KEY),
         "publicdata": bool(PUBLICDATA_KEY),
+        "csv_loaded": _csv.ok,
+        "csv_path": PNU10_CSV_PATH if _csv.ok else None,
     }
 
 @app.post("/pnu/convert", response_model=ConvertResp)
 async def pnu_convert_post(body: ConvertReq, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
     fixed = _fix_input_text(body.text)
-    data = await kakao_search_address(fixed)
-
-    docs = data.get("documents") or []
-    if not docs:
-        return ConvertResp(ok=False, input=fixed, candidates=[])
-
-    best = _pick_best_document(docs)
-    adm10, mtYn, bun, ji, full = _doc_to_pnu_parts(best)
-    pnu = f"{adm10}{mtYn}{bun}{ji}"
-
-    return ConvertResp(
-        ok=True, input=fixed, normalized=full, full=full,
-        admCd10=adm10, bun=bun, ji=ji, mtYn=mtYn, pnu=pnu, candidates=[]
-    )
+    if not _csv.ok:
+        raise HTTPException(status_code=500, detail="PNU10 CSV not loaded")
+    res = _csv.convert(fixed)
+    return ConvertResp(**res)
 
 @app.get("/pnu/convert", response_model=ConvertResp)
 async def pnu_convert_get(
@@ -185,34 +224,20 @@ async def pnu_convert_get(
 ):
     require_api_key(x_api_key)
     fixed = _fix_input_text(text)
-    data = await kakao_search_address(fixed)
-
-    docs = data.get("documents") or []
-    if not docs:
-        return ConvertResp(ok=False, input=fixed, candidates=[])
-
-    best = _pick_best_document(docs)
-    adm10, mtYn, bun, ji, full = _doc_to_pnu_parts(best)
-    pnu = f"{adm10}{mtYn}{bun}{ji}"
-
-    return ConvertResp(
-        ok=True, input=fixed, normalized=full, full=full,
-        admCd10=adm10, bun=bun, ji=ji, mtYn=mtYn, pnu=pnu, candidates=[]
-    )
+    if not _csv.ok:
+        raise HTTPException(status_code=500, detail="PNU10 CSV not loaded")
+    res = _csv.convert(fixed)
+    return ConvertResp(**res)
 
 def _split_pnu(pnu: str) -> Tuple[str, str, str, str]:
-    if not re.fullmatch(r"\d{19}", pnu):
+    import re as _re
+    if not _re.fullmatch(r"\d{19}", pnu):
         raise HTTPException(status_code=400, detail="pnu must be 19 digits")
-    adm10 = pnu[:10]
-    mtYn  = pnu[10]
-    bun   = pnu[11:15]
-    ji    = pnu[15:19]
-    return adm10, mtYn, bun, ji
+    return pnu[:10], pnu[10], pnu[11:15], pnu[15:19]
 
 @app.get("/realestate/building/by-pnu/{pnu}", response_model=BuildingBundle)
 async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-
     if not PUBLICDATA_KEY:
         raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
 
@@ -235,14 +260,9 @@ async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
     url = "https://apis.data.go.kr/1613000/BldRgstService_v2/getBrTitleInfo"
 
     async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Upstream timeout/error: {e}") from e
-        except Exception:
-            raise HTTPException(status_code=502, detail="Non-JSON response from upstream")
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
 
     building = None
     try:
