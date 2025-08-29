@@ -10,10 +10,6 @@ import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
-import pandas as pd
-import requests
-import io
-
 APP_VERSION = "7.1.0"  # CSV-only + precise 법정동 disambiguation
 
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
@@ -139,34 +135,155 @@ def _strip_bunjib(addr: str) -> str:
     return _BUN_JI_RE.sub(" ", addr)
 
 class PNUIndex:
-    def __init__(self):
+    def __init__(self, csv_path: str, encoding: str = "utf-8"):
         self.ok = False
-        self.rows = []
-        self.by_full = {}
-
+        self.rows: List[Dict[str, str]] = []
+        self.by_full: Dict[str, str] = {}
+        self.by_sigu_emd: Dict[Tuple[str, str], List[Tuple[str, str, str]]] = {}
+        self.by_emd: Dict[str, List[Tuple[str, str, str, str]]] = {}
         try:
-            # GitHub Raw URL에서 직접 불러오기
-            url = "https://raw.githubusercontent.com/blainehan/250812/main/api/pnu10.csv"
-            r = requests.get(url)
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-
-            for _, row in df.iterrows():
-                full = row["법정동"].strip()
-                pnu = str(row["pnu"]).strip()
-                self.rows.append({"법정동": full, "pnu": pnu})
-                self.by_full[full] = pnu
-
+            df = pd.read_csv(csv_path, sep=",", encoding=encoding, low_memory=False)
+            if "법정동" not in df.columns or "pnu" not in df.columns:
+                raise RuntimeError("CSV에는 '법정동', 'pnu' 컬럼이 필요합니다.")
+            df["법정동"] = df["법정동"].astype(str).str.strip()
+            df["pnu10"] = df["pnu"].astype(str).str.zfill(10)
+            for name, code in zip(df["법정동"], df["pnu10"]):
+                full = _norm_spaces(name)
+                self.rows.append({"법정동": full, "pnu": code})
+            # build indices
+            for r in self.rows:
+                full = r["법정동"]
+                code = r["pnu"]
+                si, sigu, emd = _split_parts(full)
+                self.by_full[full] = code
+                if emd:
+                    if sigu:
+                        self.by_sigu_emd.setdefault((sigu, emd), []).append((full, code, si))
+                    self.by_emd.setdefault(emd, []).append((full, code, si, sigu))
             self.ok = True
         except Exception as e:
-            print(f"[PNUIndex] CSV 로딩 실패: {e}")
+            print(f"[PNUIndex] load error: {e}")
             self.ok = False
 
-    def find(self, full_name: str):
-        return self.by_full.get(full_name.strip())
+    @staticmethod
+    def build_pnu19(code10: str, mt: int, bun: int, ji: int) -> str:
+        return f"{code10}{mt}{bun:04d}{ji:04d}"
 
-# 클래스 사용 예
-_index = PNUIndex()
+    def _lookup_pnu10_from_name(self, name: str) -> Dict[str, Any]:
+        """Core logic copied from CLI version (exact disambiguation)."""
+        q = _norm_spaces(name)
+        if not q:
+            return {"ok": False, "error": "질의가 비어 있습니다.", "query": name}
+
+        parts = q.split(" ")
+        if parts:
+            parts[0] = _canonical_si(parts[0])
+
+        full = " ".join(parts)
+        if full in self.by_full:
+            return {"ok": True, "admCd10": self.by_full[full], "matched": full}
+
+        if len(parts) >= 3:
+            cand = " ".join([_canonical_si(parts[-3]), parts[-2], parts[-1]])
+            if cand in self.by_full:
+                return {"ok": True, "admCd10": self.by_full[cand], "matched": cand}
+
+        if len(parts) == 2:
+            a, b = parts
+            # case: '서초구 양재동'
+            if a.endswith(("구", "군", "시")):
+                key = (a, b)
+                if key in self.by_sigu_emd:
+                    hits = self.by_sigu_emd[key]
+                    if len(hits) == 1:
+                        full, code, _si = hits[0]
+                        return {"ok": True, "admCd10": code, "matched": full}
+                    else:
+                        return {
+                            "ok": False,
+                            "error": "여러 시/도에서 동일한 시군구·법정동 조합이 있습니다. 시도까지 포함해 주세요.",
+                            "query": name,
+                            "candidates": [h[0] for h in hits],
+                        }
+            # case: '서울특별시 양재동'
+            key_si = _canonical_si(a)
+            cands = []
+            for full2, code2 in self.by_full.items():
+                si, sigu, emd = _split_parts(full2)
+                if si == key_si and emd == b:
+                    cands.append((full2, code2))
+            if len(cands) == 1:
+                full2, code2 = cands[0]
+                return {"ok": True, "admCd10": code2, "matched": full2}
+            elif len(cands) > 1:
+                return {
+                    "ok": False,
+                    "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
+                    "query": name,
+                    "candidates": [c[0] for c in cands],
+                }
+
+        if len(parts) == 1:
+            emd = parts[0]
+            hits = self.by_emd.get(emd, [])
+            if not hits:
+                return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": name}
+            if len(hits) == 1:
+                full, code, _si, _sigu = hits[0]
+                return {"ok": True, "admCd10": code, "matched": full}
+            return {
+                "ok": False,
+                "error": "여러 지역에서 일치합니다. '서초구 양재동'처럼 시군구를 포함해 주세요.",
+                "query": name,
+                "candidates": [h[0] for h in hits],
+            }
+
+        # Fallback: try tail match like '서울 서초구 양재동'
+        tail2 = " ".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+        cands = [full2 for full2 in self.by_full.keys() if full2.endswith(tail2)]
+        if len(cands) == 1:
+            full2 = cands[0]
+            return {"ok": True, "admCd10": self.by_full[full2], "matched": full2}
+        elif len(cands) > 1:
+            return {
+                "ok": False,
+                "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
+                "query": name,
+                "candidates": cands,
+            }
+
+        return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": name}
+
+    def lookup_from_address(self, address: str) -> Dict[str, Any]:
+        """
+        Accepts a full address line (may include bun/ji). Strips bun/ji and tries
+        precise lookup. If that fails, tries to find a full legal-dong name contained in the address.
+        """
+        cleaned = normalize_address(address)
+        name_part = _strip_bunjib(cleaned)
+        name_part = _norm_spaces(name_part)
+
+        # primary: precise logic
+        res = self._lookup_pnu10_from_name(name_part)
+        if res.get("ok") or res.get("candidates"):
+            return res
+
+        # secondary: substring search for any known full name inside the address
+        hits = [full for full in self.by_full.keys() if full in cleaned]
+        if len(hits) == 1:
+            full = hits[0]
+            return {"ok": True, "admCd10": self.by_full[full], "matched": full}
+        elif len(hits) > 1:
+            return {
+                "ok": False,
+                "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
+                "query": address,
+                "candidates": hits,
+            }
+        return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": address}
+
+# Instantiate index
+_index = PNUIndex(PNU10_CSV_PATH)
 
 # ========= FastAPI =========
 
