@@ -1,11 +1,8 @@
 {
   "functions": {
-    "**/*.py": {
+    "api/index.py": {
       "runtime": "python3.11",
       "includeFiles": "api/pnu10.csv"
     }
-  },
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/index.py" }
-  ]
+  }
 }
