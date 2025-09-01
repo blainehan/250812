@@ -14,7 +14,10 @@ APP_VERSION = "7.1.0"  # CSV-only + precise 법정동 disambiguation
 
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
 PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")
-PNU10_CSV_PATH = os.getenv("PNU10_CSV_PATH", "api/pnu10.csv")
+BASE_DIR = os.path.dirname(__file__)
+PNU10_CSV_PATH = os.getenv("PNU10_CSV_PATH", os.path.join(BASE_DIR, "pnu10.csv"))
+
+df = pd.read_csv(PNU10_CSV_PATH, encoding="utf-8-sig")
 
 def require_api_key(x_api_key: Optional[str]):
     if not SERVICE_API_KEY:
