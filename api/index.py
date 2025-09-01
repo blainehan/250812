@@ -17,7 +17,6 @@ PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")
 BASE_DIR = os.path.dirname(__file__)
 PNU10_CSV_PATH = os.getenv("PNU10_CSV_PATH", os.path.join(BASE_DIR, "pnu10.csv"))
 
-df = pd.read_csv(PNU10_CSV_PATH, encoding="utf-8-sig")
 
 def require_api_key(x_api_key: Optional[str]):
     if not SERVICE_API_KEY:
