@@ -6,17 +6,20 @@ from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import httpx
-import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 # ================== 앱/환경 ==================
-APP_VERSION = "8.0.1"  # CSV-only, packaged pnu10.csv, precise disambiguation
+APP_VERSION = "9.2.0-mois-only-onekey"  # CSV 제거, MOIS 스펙 100% 반영, 공공데이터키 1개 사용
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
-PUBLICDATA_KEY = os.getenv("PUBLICDATA_KEY", "")
 
-BASE_DIR = os.path.dirname(__file__)
-PNU10_CSV_PATH = os.getenv("PNU10_CSV_PATH", os.path.join(BASE_DIR, "pnu10.csv"))
+# 공공데이터포털 서비스키(Decoding Key 권장) - 행안부/건축물대장 공용
+PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")
+MOIS_SERVICE_KEY = PUBLICDATA_KEY  # 같은 키 사용
+
+# MOIS(행안부) 법정표준코드 API
+MOIS_BASE_URL  = os.getenv("MOIS_BASE_URL", "https://apis.data.go.kr/1741000/StanReginCd")
+MOIS_LIST_PATH = os.getenv("MOIS_LIST_PATH", "getStanReginCdList")  # 법정동코드 조회
 
 # ================== 공통 유틸 ==================
 def utc_now_iso() -> str:
@@ -48,7 +51,7 @@ def _fix_input_text(raw: str) -> str:
                 text = text2
         except Exception:
             pass
-    # U+FFFD(�)가 포함되면 간단 복구 시도
+    # U+FFFD(�) 포함 시 간단 복구 시도
     if "\ufffd" in text:
         try:
             text = text.encode("latin-1", "ignore").decode("cp949")
@@ -79,7 +82,8 @@ _BUN_JI_RE = re.compile(
 )
 
 def parse_bunjib(addr: str) -> Tuple[int, Optional[int], Optional[int]]:
-    mt = 1 if re.search(r"\b산\s*\d", addr) else 0
+    # '산'은 숫자 바로 앞에 올 때만 산지 처리(오탐 방지)
+    mt = 1 if re.search(r"(?<![가-힣A-Za-z])산\s*\d", addr) else 0
     matches = list(_BUN_JI_RE.finditer(addr or ""))
     if not matches:
         return mt, None, None
@@ -91,7 +95,7 @@ def parse_bunjib(addr: str) -> Tuple[int, Optional[int], Optional[int]]:
 def _strip_bunjib(addr: str) -> str:
     return _BUN_JI_RE.sub(" ", addr or "")
 
-# ================== 행정구역명 정규화 ==================
+# ================== 행정구역 정규화 ==================
 _SI_SYNONYMS = {
     "서울": "서울특별시", "서울시": "서울특별시",
     "부산": "부산광역시", "부산시": "부산광역시",
@@ -123,162 +127,202 @@ def _split_parts(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]
         return parts[0], None, parts[1]       # si/emd
     return parts[0], parts[1], parts[-1]      # si/sigu/emd
 
-# ================== CSV 인덱스 ==================
-class PNUIndex:
+# ================== MOIS(행안부) API 클라이언트 — 문서 스펙 100% 일치 ==================
+class MOISClient:
     """
-    pnu10.csv를 메모리에 적재하고, 다양한 입력에서 10자리 법정동코드(admCd10)를 찾아줌.
+    행정표준코드(법정동코드) API 조회 (StanReginCd/getStanReginCdList).
+    - 요청 파라미터: ServiceKey, type=json, flag=Y, pageNo, numOfRows, locatadd_nm
+    - 응답 필드: region_cd(10자리 법정동코드), locatadd_nm(지역주소명), locat_order(서열)
+    스펙 근거: 행안부 Open API 활용가이드:contentReference[oaicite:1]{index=1}
     """
-    def __init__(self, csv_path: str, encoding: str = "utf-8-sig"):
-        self.ok = False
-        self.rows: List[Dict[str, str]] = []
-        self.by_full: Dict[str, str] = {}
-        self.by_sigu_emd: Dict[Tuple[str, str], List[Tuple[str, str, str]]] = {}
-        self.by_emd: Dict[str, List[Tuple[str, str, str, str]]] = {}
-        try:
-            df = pd.read_csv(csv_path, sep=",", encoding=encoding, low_memory=False)
-            if "법정동" not in df.columns or "pnu" not in df.columns:
-                raise RuntimeError("CSV에는 '법정동', 'pnu' 컬럼이 필요합니다.")
-            df["법정동"] = df["법정동"].astype(str).str.strip()
-            df["pnu10"] = df["pnu"].astype(str).str.zfill(10)
+    def __init__(self, base_url: str, list_path: str, service_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.list_path = list_path.strip("/")
+        self.key = service_key
 
-            for name, code in zip(df["법정동"], df["pnu10"]):
-                full = _norm_spaces(name)
-                self.rows.append({"법정동": full, "pnu": code})
-
-            # 인덱스 구성
-            for r in self.rows:
-                full = r["법정동"]
-                code = r["pnu"]
-                si, sigu, emd = _split_parts(full)
-                self.by_full[full] = code
-                if emd:
-                    if sigu:
-                        self.by_sigu_emd.setdefault((sigu, emd), []).append((full, code, si))
-                    self.by_emd.setdefault(emd, []).append((full, code, si, sigu))
-
-            self.ok = True
-        except Exception as e:
-            # 로드 실패 시에도 서버는 살아있게 하고 /healthz로 상태 노출
-            print(f"[PNUIndex] load error: {e}")
-            self.ok = False
+    def _endpoint(self) -> str:
+        # 예: https://apis.data.go.kr/1741000/StanReginCd/getStanReginCdList
+        return f"{self.base_url}/{self.list_path}"
 
     @staticmethod
-    def build_pnu19(code10: str, mt: int, bun: int, ji: int) -> str:
-        return f"{code10}{mt}{bun:04d}{ji:04d}"
+    def _extract_items(payload: dict) -> List[dict]:
+        """
+        response -> body -> items -> item (list or single) 구조를 안전 파싱:contentReference[oaicite:2]{index=2}
+        """
+        try:
+            resp = payload.get("response") or {}
+            body = resp.get("body") or {}
+            items = (body.get("items") or {}).get("item")
+            if isinstance(items, list):
+                return items
+            if isinstance(items, dict):
+                return [items]
+            return []
+        except Exception:
+            return []
 
-    # --- 핵심 룩업 로직 ---
-    def _lookup_pnu10_from_name(self, name: str) -> Dict[str, Any]:
-        q = _norm_spaces(name)
-        if not q:
+    @staticmethod
+    def _result_header(payload: dict) -> Dict[str, Any]:
+        """
+        결과코드/메시지 획득 (일부 구현의 header/RESULT 혼재를 방어):contentReference[oaicite:3]{index=3}
+        """
+        resp = payload.get("response") or {}
+        header = resp.get("header") or {}
+        if not header and "RESULT" in (resp.get("head") or {}):
+            header = (resp.get("head") or {}).get("RESULT", {})
+        return {
+            "resultCode": header.get("resultCode"),
+            "resultMsg": header.get("resultMsg"),
+        }
+
+    @staticmethod
+    def _adm10_from_item(it: dict) -> Optional[str]:
+        """
+        region_cd: 10자리 법정동코드 (문서 스펙):contentReference[oaicite:4]{index=4}
+        """
+        adm = str(it.get("region_cd") or "").strip()
+        return adm if (len(adm) == 10 and adm.isdigit()) else None
+
+    @staticmethod
+    def _is_legal_dong_level(it: dict) -> bool:
+        """
+        locat_order(서열)로 3단계(시/도-시군구-법정동)를 우선 채택:contentReference[oaicite:5]{index=5}.
+        """
+        return str(it.get("locat_order") or "").strip() == "3"
+
+    @staticmethod
+    def _name_of(it: dict) -> str:
+        """
+        지역주소명: locatadd_nm (문서 스펙):contentReference[oaicite:6]{index=6}
+        """
+        return _norm_spaces(str(it.get("locatadd_nm") or it.get("locallow_nm") or ""))
+
+    async def _query(self, params: Dict[str, Any]) -> List[dict]:
+        """
+        요청 파라미터를 문서 명세와 동일하게 사용:
+        - ServiceKey(필수, URL-Encode 권장), type(json/xml), flag(Y), pageNo, numOfRows, locatadd_nm:contentReference[oaicite:7]{index=7}
+        """
+        if not self.key:
+            raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
+
+        q = {
+            "ServiceKey": self.key,   # 문서 표기 그대로(대소문자)
+            "type": "json",           # JSON 응답
+            "flag": "Y",              # 문서 예시의 신규API 플래그
+            "pageNo": params.pop("pageNo", 1),
+            "numOfRows": params.pop("numOfRows", 50),
+        }
+        q.update(params)  # locatadd_nm 등
+
+        url = self._endpoint()
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, params=q)
+            r.raise_for_status()
+            data = r.json()
+
+        # 결과코드 확인(정상: 00 또는 INFO-0)
+        hdr = self._result_header(data)
+        rc = (hdr.get("resultCode") or "").upper()
+        if rc and rc not in ("00", "INFO-0"):
+            raise HTTPException(status_code=502, detail=f"MOIS API error: {hdr}")
+
+        return self._extract_items(data)
+
+    async def find_adm10(self, name: str) -> Dict[str, Any]:
+        """
+        입력 명칭(name)에서 10자리 법정동코드(region_cd)를 유추.
+        - 완전일치(locatadd_nm) → (시군구,법정동)/(시,법정동) 조합 → tail 2토큰 → 단일 토큰은 안내
+        """
+        name = _norm_spaces(name)
+        if not name:
             return {"ok": False, "error": "질의가 비어 있습니다.", "query": name}
 
-        parts = q.split(" ")
+        # 맨 앞 토큰 시·도 정규화
+        parts = name.split(" ")
         if parts:
             parts[0] = _canonical_si(parts[0])
+        name_norm = " ".join(parts)
 
-        full = " ".join(parts)
-        if full in self.by_full:  # 완전일치
-            return {"ok": True, "admCd10": self.by_full[full], "matched": full}
-
-        if len(parts) >= 3:
-            cand = " ".join([_canonical_si(parts[-3]), parts[-2], parts[-1]])
-            if cand in self.by_full:
-                return {"ok": True, "admCd10": self.by_full[cand], "matched": cand}
-
-        if len(parts) == 2:
-            a, b = parts
-
-            # case: '서초구 양재동'
-            if a.endswith(("구", "군", "시")):
-                key = (a, b)
-                hits = self.by_sigu_emd.get(key, [])
-                if len(hits) == 1:
-                    full2, code2, _si = hits[0]
-                    return {"ok": True, "admCd10": code2, "matched": full2}
-                elif len(hits) > 1:
-                    return {
-                        "ok": False,
-                        "error": "여러 시/도에서 동일한 조합이 있습니다. 시도까지 포함해 주세요.",
-                        "query": name,
-                        "candidates": [h[0] for h in hits],
-                    }
-
-            # case: '서울특별시 양재동'
-            key_si = _canonical_si(a)
-            cands: List[Tuple[str, str]] = []
-            for full2, code2 in self.by_full.items():
-                si, sigu, emd = _split_parts(full2)
-                if si == key_si and emd == b:
-                    cands.append((full2, code2))
-            if len(cands) == 1:
-                full2, code2 = cands[0]
-                return {"ok": True, "admCd10": code2, "matched": full2}
-            elif len(cands) > 1:
+        # 1) 완전 일치
+        items = await self._query({"locatadd_nm": name_norm})
+        if items:
+            exact = [it for it in items if self._name_of(it) == name_norm]
+            # 서열 3단계 우선
+            exact_lvl3 = [it for it in exact if self._is_legal_dong_level(it)]
+            pool = exact_lvl3 or exact or items
+            pool = [it for it in pool if self._adm10_from_item(it)]
+            uniq = {(self._name_of(it), self._adm10_from_item(it)) for it in pool}
+            if len(uniq) == 1:
+                full, adm = next(iter(uniq))
+                return {"ok": True, "admCd10": adm, "matched": full}
+            elif len(uniq) > 1:
                 return {
                     "ok": False,
                     "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
                     "query": name,
-                    "candidates": [c[0] for c in cands],
+                    "candidates": [f for f, _ in sorted(uniq)],
                 }
 
-        if len(parts) == 1:
-            emd = parts[0]
-            hits = self.by_emd.get(emd, [])
-            if not hits:
-                return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": name}
-            if len(hits) == 1:
-                full2, code2, _si, _sigu = hits[0]
-                return {"ok": True, "admCd10": code2, "matched": full2}
-            return {
-                "ok": False,
-                "error": "여러 지역에서 일치합니다. '서초구 양재동'처럼 시군구를 포함해 주세요.",
-                "query": name,
-                "candidates": [h[0] for h in hits],
-            }
+        # 2) 시군구+법정동 / 시+법정동 조합
+        si, sigu, emd = _split_parts(name_norm)
+        combos: List[str] = []
+        if sigu and emd:
+            combos.append(f"{_canonical_si(si) if si else ''} {sigu} {emd}".strip())
+        if si and emd and not sigu:
+            combos.append(f"{_canonical_si(si)} {emd}")
 
-        # Fallback: 꼬리 2토큰 일치 ('... 서초구 양재동')
-        tail2 = " ".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-        cands = [full2 for full2 in self.by_full.keys() if full2.endswith(tail2)]
-        if len(cands) == 1:
-            full2 = cands[0]
-            return {"ok": True, "admCd10": self.by_full[full2], "matched": full2}
-        elif len(cands) > 1:
+        for cand in combos:
+            items = await self._query({"locatadd_nm": cand})
+            if not items:
+                continue
+            lvl3 = [it for it in items if self._is_legal_dong_level(it)]
+            pool = lvl3 or items
+            pool = [it for it in pool if self._adm10_from_item(it)]
+            uniq = {(self._name_of(it), self._adm10_from_item(it)) for it in pool}
+            if len(uniq) == 1:
+                full, adm = next(iter(uniq))
+                return {"ok": True, "admCd10": adm, "matched": full}
+            elif len(uniq) > 1:
+                return {
+                    "ok": False,
+                    "error": "여러 지역에서 일치합니다. 시도/시군구를 포함해 주세요.",
+                    "query": name,
+                    "candidates": [f for f, _ in sorted(uniq)],
+                }
+
+        # 3) 꼬리 2토큰 (예: "... 서초구 양재동")
+        tokens = name_norm.split(" ")
+        if len(tokens) >= 2:
+            tail2 = " ".join(tokens[-2:])
+            items = await self._query({"locatadd_nm": tail2})
+            if items:
+                lvl3 = [it for it in items if self._is_legal_dong_level(it)]
+                pool = lvl3 or items
+                pool = [it for it in pool if self._adm10_from_item(it)]
+                uniq = {(self._name_of(it), self._adm10_from_item(it)) for it in pool}
+                if len(uniq) == 1:
+                    full, adm = next(iter(uniq))
+                    return {"ok": True, "admCd10": adm, "matched": full}
+                elif len(uniq) > 1:
+                    return {
+                        "ok": False,
+                        "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
+                        "query": name,
+                        "candidates": [f for f, _ in sorted(uniq)],
+                    }
+
+        # 4) 단일 토큰(emd-only)은 모호 가능 → 안내
+        if len(tokens) == 1:
             return {
                 "ok": False,
-                "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
+                "error": "여러 지역에서 일치할 수 있습니다. '시군구 법정동' 형식으로 입력해 주세요.",
                 "query": name,
-                "candidates": cands,
             }
 
         return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": name}
 
-    def lookup_from_address(self, address: str) -> Dict[str, Any]:
-        """주소 문자열(번지 포함 가능)에서 법정동명을 찾아 10자리 코드를 반환."""
-        cleaned = normalize_address(address)
-        name_part = _strip_bunjib(cleaned)
-        name_part = _norm_spaces(name_part)
-
-        # 1) 정밀 매칭
-        res = self._lookup_pnu10_from_name(name_part)
-        if res.get("ok") or res.get("candidates"):
-            return res
-
-        # 2) 보조: 주소에 포함된 전체 법정동명 서브스트링 탐색
-        hits = [full for full in self.by_full.keys() if full in cleaned]
-        if len(hits) == 1:
-            full = hits[0]
-            return {"ok": True, "admCd10": self.by_full[full], "matched": full}
-        elif len(hits) > 1:
-            return {
-                "ok": False,
-                "error": "여러 지역에서 일치합니다. 시군구를 포함해 주세요.",
-                "query": address,
-                "candidates": hits,
-            }
-        return {"ok": False, "error": "법정동을 찾지 못했습니다.", "query": address}
-
-# 전역 인덱스(모듈 로드시 로드 시도하지만 실패해도 앱은 동작)
-_index = PNUIndex(PNU10_CSV_PATH)
+# 전역 MOIS 클라이언트
+_mois = MOISClient(MOIS_BASE_URL, MOIS_LIST_PATH, MOIS_SERVICE_KEY)
 
 # ================== 스키마 ==================
 class ConvertReq(BaseModel):
@@ -294,7 +338,7 @@ class ConvertResp(BaseModel):
     ji: Optional[str] = None
     mtYn: Optional[str] = None
     pnu: Optional[str] = None            # 19자리 PNU
-    source: Optional[str] = None         # "csv"
+    source: Optional[str] = None         # "mois"
     candidates: Optional[List[str]] = None
     version: Optional[str] = None
 
@@ -305,26 +349,26 @@ class BuildingBundle(BaseModel):
 
 # ================== FastAPI 앱 ==================
 app = FastAPI(
-    title="RealEstate Toolkit (CSV-only)",
-    description="CSV(법정동 10자리) 기반 주소→PNU, 공공데이터포털로 PNU→건축물대장(표제부)",
+    title="RealEstate Toolkit (MOIS API only, one key)",
+    description="행안부 법정표준코드 API 기반 주소→PNU, 국토부 API로 PNU→건축물대장(표제부) — 공공데이터 서비스키 하나로 통합",
     version=APP_VERSION,
 )
 
 @app.get("/")
 async def root():
-    return {"service": "RealEstate Toolkit (CSV-only)", "version": APP_VERSION}
+    return {"service": "RealEstate Toolkit (MOIS, one key)", "version": APP_VERSION}
 
 @app.get("/healthz")
 async def healthz():
     return {
         "ok": True,
         "time": utc_now_iso(),
-        "publicdata": bool(PUBLICDATA_KEY),
-        "pnu10_loaded": {
-            "path": PNU10_CSV_PATH if _index.ok else None,
-            "entries": len(_index.rows) if _index.ok else 0,
-            "base_dir": BASE_DIR,
+        "mois": {
+            "base": MOIS_BASE_URL,
+            "path": MOIS_LIST_PATH,
+            "has_key": bool(MOIS_SERVICE_KEY),
         },
+        "publicdata": bool(PUBLICDATA_KEY),
         "version": APP_VERSION,
     }
 
@@ -334,49 +378,54 @@ async def version():
 
 @app.get("/_healthz")
 async def _healthz():
-    # 동일 정보(운영 중 빠르게 확인용)
     return await healthz()
 
-# -------- 주소→PNU 변환 --------
-def _convert_impl(address: str) -> ConvertResp:
-    addr = normalize_address(address)
-    mt, bun, ji = parse_bunjib(addr)
+# ---- 공통: 19자리 PNU 조립 ----
+def build_pnu19(code10: str, mt: int, bun: int, ji: int) -> str:
+    return f"{code10}{mt}{bun:04d}{ji:04d}"
 
-    res10 = _index.lookup_from_address(addr)
+# -------- 주소→PNU 변환 (MOIS만 사용) --------
+def _convert_base(addr: str, res10: Dict[str, Any], mt: Optional[int], bun: Optional[int], ji: Optional[int]) -> ConvertResp:
     base = {
         "ok": False,
-        "input": address,
-        "normalized": addr,
+        "input": addr,
+        "normalized": normalize_address(addr),
         "full": res10.get("matched"),
         "admCd10": res10.get("admCd10"),
         "bun": f"{bun:04d}" if isinstance(bun, int) else None,
         "ji": f"{ji:04d}" if isinstance(ji, int) else None,
-        "mtYn": str(mt) if isinstance(mt, int) else None,
+        "mtYn": (str(mt) if isinstance(mt, int) else None),
         "pnu": None,
-        "source": "csv",
+        "source": "mois",
         "candidates": res10.get("candidates"),
         "version": APP_VERSION,
     }
-
-    if not res10.get("ok"):  # 모호하거나 미발견 → 후보/상태만 반환
+    if not res10.get("ok"):
         return ConvertResp(**base)
 
-    if bun is None:          # 번지 미지정: 10자리 코드까지만
+    if bun is None:
         base["ok"] = True
         return ConvertResp(**base)
 
-    # 19자리 PNU 조립
-    pnu19 = PNUIndex.build_pnu19(res10["admCd10"], mt, bun, ji if ji is not None else 0)
+    pnu19 = build_pnu19(res10["admCd10"], mt or 0, bun, (ji if ji is not None else 0))
     base.update({"ok": True, "pnu": pnu19})
     return ConvertResp(**base)
+
+async def _convert_impl_async(address: str) -> ConvertResp:
+    addr = normalize_address(address)
+    mt, bun, ji = parse_bunjib(addr)
+    name_part = _strip_bunjib(addr)
+    name_part = _norm_spaces(name_part)
+    res10 = await _mois.find_adm10(name_part if name_part else addr)
+    return _convert_base(address, res10, mt, bun, ji)
 
 @app.post("/pnu/convert", response_model=ConvertResp)
 async def pnu_convert_post(body: ConvertReq, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    if not _index.ok:
-        raise HTTPException(status_code=500, detail="PNU10 CSV not loaded")
+    if not PUBLICDATA_KEY:
+        raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
     fixed = _fix_input_text(body.text)
-    return _convert_impl(fixed)
+    return await _convert_impl_async(fixed)
 
 @app.get("/pnu/convert", response_model=ConvertResp)
 async def pnu_convert_get(
@@ -384,10 +433,10 @@ async def pnu_convert_get(
     x_api_key: Optional[str] = Header(None),
 ):
     require_api_key(x_api_key)
-    if not _index.ok:
-        raise HTTPException(status_code=500, detail="PNU10 CSV not loaded")
+    if not PUBLICDATA_KEY:
+        raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
     fixed = _fix_input_text(text)
-    return _convert_impl(fixed)
+    return await _convert_impl_async(fixed)
 
 # -------- PNU→건축물대장(표제부) --------
 def _split_pnu(pnu: str) -> Tuple[str, str, str, str]:
@@ -403,8 +452,8 @@ async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
 
     adm10, mtYn, bun, ji = _split_pnu(pnu)
     sigunguCd = adm10[:5]
-    bjdongCd = adm10[5:]
-    platGbCd = "1" if mtYn == "1" else "0"
+    bjdongCd  = adm10[5:]
+    platGbCd  = "1" if mtYn == "1" else "0"
 
     params = {
         "_type": "json",
