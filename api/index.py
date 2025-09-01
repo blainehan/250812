@@ -2,23 +2,25 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ================== 앱/환경 ==================
-APP_VERSION = "9.2.0-mois-only-onekey"  # CSV 제거, MOIS 스펙 100% 반영, 공공데이터키 1개 사용
+APP_VERSION = "9.3.0-mois-only-onekey"  # CSV 제거, MOIS 스펙 100% 반영, 공공데이터키 1개 사용 + 안정화
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
 
 # 공공데이터포털 서비스키(Decoding Key 권장) - 행안부/건축물대장 공용
-PUBLICDATA_KEY  = os.getenv("PUBLICDATA_KEY", "")
+PUBLICDATA_KEY = os.getenv("PUBLICDATA_KEY", "")
 MOIS_SERVICE_KEY = PUBLICDATA_KEY  # 같은 키 사용
 
 # MOIS(행안부) 법정표준코드 API
-MOIS_BASE_URL  = os.getenv("MOIS_BASE_URL", "https://apis.data.go.kr/1741000/StanReginCd")
+MOIS_BASE_URL = os.getenv("MOIS_BASE_URL", "https://apis.data.go.kr/1741000/StanReginCd")
 MOIS_LIST_PATH = os.getenv("MOIS_LIST_PATH", "getStanReginCdList")  # 법정동코드 조회
 
 # ================== 공통 유틸 ==================
@@ -82,12 +84,15 @@ _BUN_JI_RE = re.compile(
 )
 
 def parse_bunjib(addr: str) -> Tuple[int, Optional[int], Optional[int]]:
-    # '산'은 숫자 바로 앞에 올 때만 산지 처리(오탐 방지)
+    """
+    '산'은 숫자 바로 앞에서만 산지로 인정(예: '산 23-4').
+    주소 내 여러 번/지 표기가 있으면 가장 마지막 것을 채택.
+    """
     mt = 1 if re.search(r"(?<![가-힣A-Za-z])산\s*\d", addr) else 0
     matches = list(_BUN_JI_RE.finditer(addr or ""))
     if not matches:
         return mt, None, None
-    m = matches[-1]  # 마지막 표기 채택
+    m = matches[-1]
     bun = int(m.group("bun"))
     ji = int(m.group("ji")) if m.group("ji") else 0
     return mt, bun, ji
@@ -127,13 +132,28 @@ def _split_parts(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]
         return parts[0], None, parts[1]       # si/emd
     return parts[0], parts[1], parts[-1]      # si/sigu/emd
 
-# ================== MOIS(행안부) API 클라이언트 — 문서 스펙 100% 일치 ==================
+# ================== httpx 공통 옵션/재시도 ==================
+_HTTPX_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+_HTTPX_TIMEOUT = httpx.Timeout(connect=10, read=20, write=10, pool=10)
+
+async def _with_retries(func, *, retries=2, base_delay=0.5, exc=Exception):
+    last = None
+    for i in range(retries + 1):
+        try:
+            return await func()
+        except exc as e:
+            last = e
+            if i == retries:
+                break
+            await asyncio.sleep(base_delay * (2 ** i))
+    raise last
+
+# ================== MOIS(행안부) API 클라이언트 ==================
 class MOISClient:
     """
     행정표준코드(법정동코드) API 조회 (StanReginCd/getStanReginCdList).
-    - 요청 파라미터: ServiceKey, type=json, flag=Y, pageNo, numOfRows, locatadd_nm
-    - 응답 필드: region_cd(10자리 법정동코드), locatadd_nm(지역주소명), locat_order(서열)
-    스펙 근거: 행안부 Open API 활용가이드:contentReference[oaicite:1]{index=1}
+    - 요청: ServiceKey/serviceKey, type=json, flag=Y, pageNo, numOfRows, locatadd_nm
+    - 응답: region_cd(10), locatadd_nm, locat_order
     """
     def __init__(self, base_url: str, list_path: str, service_key: str):
         self.base_url = base_url.rstrip("/")
@@ -146,9 +166,6 @@ class MOISClient:
 
     @staticmethod
     def _extract_items(payload: dict) -> List[dict]:
-        """
-        response -> body -> items -> item (list or single) 구조를 안전 파싱:contentReference[oaicite:2]{index=2}
-        """
         try:
             resp = payload.get("response") or {}
             body = resp.get("body") or {}
@@ -163,70 +180,65 @@ class MOISClient:
 
     @staticmethod
     def _result_header(payload: dict) -> Dict[str, Any]:
-        """
-        결과코드/메시지 획득 (일부 구현의 header/RESULT 혼재를 방어):contentReference[oaicite:3]{index=3}
-        """
         resp = payload.get("response") or {}
         header = resp.get("header") or {}
         if not header and "RESULT" in (resp.get("head") or {}):
             header = (resp.get("head") or {}).get("RESULT", {})
         return {
-            "resultCode": header.get("resultCode"),
+            "resultCode": (header.get("resultCode") or header.get("RESULT_CODE")),
             "resultMsg": header.get("resultMsg"),
         }
 
     @staticmethod
     def _adm10_from_item(it: dict) -> Optional[str]:
-        """
-        region_cd: 10자리 법정동코드 (문서 스펙):contentReference[oaicite:4]{index=4}
-        """
         adm = str(it.get("region_cd") or "").strip()
         return adm if (len(adm) == 10 and adm.isdigit()) else None
 
     @staticmethod
     def _is_legal_dong_level(it: dict) -> bool:
-        """
-        locat_order(서열)로 3단계(시/도-시군구-법정동)를 우선 채택:contentReference[oaicite:5]{index=5}.
-        """
         return str(it.get("locat_order") or "").strip() == "3"
 
     @staticmethod
     def _name_of(it: dict) -> str:
-        """
-        지역주소명: locatadd_nm (문서 스펙):contentReference[oaicite:6]{index=6}
-        """
         return _norm_spaces(str(it.get("locatadd_nm") or it.get("locallow_nm") or ""))
 
     async def _query(self, params: Dict[str, Any]) -> List[dict]:
-        """
-        요청 파라미터를 문서 명세와 동일하게 사용:
-        - ServiceKey(필수, URL-Encode 권장), type(json/xml), flag(Y), pageNo, numOfRows, locatadd_nm:contentReference[oaicite:7]{index=7}
-        """
         if not self.key:
             raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
 
+        # 대/소문자 키 동시 전달(일부 배포차 방어)
         q = {
-            "ServiceKey": self.key,   # 문서 표기 그대로(대소문자)
-            "type": "json",           # JSON 응답
-            "flag": "Y",              # 문서 예시의 신규API 플래그
+            "ServiceKey": self.key,      # 대문자
+            "serviceKey": self.key,      # 소문자
+            "type": "json",
+            "flag": "Y",
             "pageNo": params.pop("pageNo", 1),
             "numOfRows": params.pop("numOfRows", 50),
         }
         q.update(params)  # locatadd_nm 등
 
         url = self._endpoint()
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url, params=q)
-            r.raise_for_status()
-            data = r.json()
 
-        # 결과코드 확인(정상: 00 또는 INFO-0)
+        async def _call():
+            async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, limits=_HTTPX_LIMITS) as client:
+                r = await client.get(url, params=q)
+                r.raise_for_status()
+                return r.json()
+
+        data = await _with_retries(_call, retries=2)
+
         hdr = self._result_header(data)
         rc = (hdr.get("resultCode") or "").upper()
-        if rc and rc not in ("00", "INFO-0"):
+
+        # 무자료 케이스 방어(운영에서 INFO-200/03/NODATA 등)
+        items = self._extract_items(data)
+        if rc in ("03", "NODATA", "INFO-200") and not items:
+            return []
+
+        if rc and rc not in ("00", "INFO-0", "INFO-200", "03", "NODATA"):
             raise HTTPException(status_code=502, detail=f"MOIS API error: {hdr}")
 
-        return self._extract_items(data)
+        return items
 
     async def find_adm10(self, name: str) -> Dict[str, Any]:
         """
@@ -247,7 +259,6 @@ class MOISClient:
         items = await self._query({"locatadd_nm": name_norm})
         if items:
             exact = [it for it in items if self._name_of(it) == name_norm]
-            # 서열 3단계 우선
             exact_lvl3 = [it for it in exact if self._is_legal_dong_level(it)]
             pool = exact_lvl3 or exact or items
             pool = [it for it in pool if self._adm10_from_item(it)]
@@ -347,11 +358,35 @@ class BuildingBundle(BaseModel):
     building: Optional[dict] = None
     lastUpdatedAt: str
 
+class BuildingByAddressResp(BaseModel):
+    ok: bool
+    input: str
+    normalized: Optional[str] = None
+    full: Optional[str] = None
+    admCd10: Optional[str] = None
+    bun: Optional[str] = None
+    ji: Optional[str] = None
+    mtYn: Optional[str] = None
+    pnu: Optional[str] = None
+    building: Optional[dict] = None
+    candidates: Optional[List[str]] = None
+    version: Optional[str] = None
+    lastUpdatedAt: str
+
 # ================== FastAPI 앱 ==================
 app = FastAPI(
     title="RealEstate Toolkit (MOIS API only, one key)",
     description="행안부 법정표준코드 API 기반 주소→PNU, 국토부 API로 PNU→건축물대장(표제부) — 공공데이터 서비스키 하나로 통합",
     version=APP_VERSION,
+)
+
+# (선택) CORS: 배포 프론트 도메인 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("CORS_ALLOW_ORIGINS", "*")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -444,6 +479,33 @@ def _split_pnu(pnu: str) -> Tuple[str, str, str, str]:
         raise HTTPException(status_code=400, detail="pnu must be 19 digits")
     return pnu[:10], pnu[10], pnu[11:15], pnu[15:19]
 
+def _pick_representative_building(items: List[dict]) -> Optional[dict]:
+    if not items:
+        return None
+    # 정렬 키: 사용승인일 내림차순 → 연면적 내림차순 → 원본 순
+    def _dt(s):
+        v = (s or "").strip()
+        if not v or not v.isdigit():
+            return 0
+        try:
+            return int(v)  # YYYYMMDD
+        except Exception:
+            return 0
+
+    def _float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    sorted_items = sorted(
+        items,
+        key=lambda it: (_dt(str(it.get("useAprDay") or it.get("useAprDayStr") or "")),
+                        _float(it.get("totArea") or it.get("totarea") or 0.0)),
+        reverse=True
+    )
+    return sorted_items[0]
+
 @app.get("/realestate/building/by-pnu/{pnu}", response_model=BuildingBundle)
 async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
@@ -452,8 +514,8 @@ async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
 
     adm10, mtYn, bun, ji = _split_pnu(pnu)
     sigunguCd = adm10[:5]
-    bjdongCd  = adm10[5:]
-    platGbCd  = "1" if mtYn == "1" else "0"
+    bjdongCd = adm10[5:]
+    platGbCd = "1" if mtYn == "1" else "0"
 
     params = {
         "_type": "json",
@@ -462,27 +524,66 @@ async def building_by_pnu(pnu: str, x_api_key: Optional[str] = Header(None)):
         "platGbCd": platGbCd,
         "bun": bun,
         "ji": ji,
-        "numOfRows": 10,
+        "numOfRows": 20,
         "pageNo": 1,
-        "serviceKey": PUBLICDATA_KEY,
+        "serviceKey": PUBLICDATA_KEY,  # 국토부 API는 소문자 선호
     }
     url = "https://apis.data.go.kr/1613000/BldRgstService_v2/getBrTitleInfo"
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
+    async def _call():
+        async with httpx.AsyncClient(timeout=_HTTPX_TIMEOUT, limits=_HTTPX_LIMITS) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+
+    data = await _with_retries(_call, retries=2)
 
     building = None
     try:
         body = (data.get("response") or {}).get("body") or {}
         items = (body.get("items") or {})
         item = items.get("item")
-        if isinstance(item, list):
-            building = item[0] if item else None
-        elif isinstance(item, dict):
-            building = item
+        arr = item if isinstance(item, list) else ([item] if isinstance(item, dict) else [])
+        building = _pick_representative_building(arr)
     except Exception:
         building = None
 
     return BuildingBundle(pnu=pnu, building=building, lastUpdatedAt=utc_now_iso())
+
+# -------- 주소→(PNU→표제부) 원스텝 --------
+@app.get("/realestate/building/by-address", response_model=BuildingByAddressResp)
+async def building_by_address(
+    text: str = Query(..., description="예: '서울특별시 서초구 양재동 2-14'"),
+    x_api_key: Optional[str] = Header(None),
+):
+    require_api_key(x_api_key)
+    if not PUBLICDATA_KEY:
+        raise HTTPException(status_code=500, detail="PUBLICDATA_KEY not set")
+
+    fixed = _fix_input_text(text)
+    conv = await _convert_impl_async(fixed)
+
+    if not conv.ok:
+        return BuildingByAddressResp(
+            ok=False, input=text, normalized=conv.normalized, full=conv.full,
+            admCd10=conv.admCd10, bun=conv.bun, ji=conv.ji, mtYn=conv.mtYn,
+            pnu=None, building=None, candidates=conv.candidates,
+            version=APP_VERSION, lastUpdatedAt=utc_now_iso()
+        )
+
+    # 번지가 없으면 PNU가 없으므로 표제부는 생략(상세 입력 유도)
+    if not conv.pnu:
+        return BuildingByAddressResp(
+            ok=True, input=text, normalized=conv.normalized, full=conv.full,
+            admCd10=conv.admCd10, bun=conv.bun, ji=conv.ji, mtYn=conv.mtYn,
+            pnu=None, building=None, candidates=conv.candidates,
+            version=APP_VERSION, lastUpdatedAt=utc_now_iso()
+        )
+
+    bundle = await building_by_pnu(conv.pnu, x_api_key=x_api_key)
+    return BuildingByAddressResp(
+        ok=True, input=text, normalized=conv.normalized, full=conv.full,
+        admCd10=conv.admCd10, bun=conv.bun, ji=conv.ji, mtYn=conv.mtYn,
+        pnu=conv.pnu, building=bundle.building, candidates=conv.candidates,
+        version=APP_VERSION, lastUpdatedAt=bundle.lastUpdatedAt
+    )
